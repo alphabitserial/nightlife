@@ -1,0 +1,3 @@
+add fs watch on cosmic setting file, automatically change settings
+fix up error handling
+add config file for setting theme names (?)
