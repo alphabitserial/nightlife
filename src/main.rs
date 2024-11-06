@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const DARK_THEME: &str = "modus_vivendi";
 const LIGHT_THEME: &str = "modus_operandi";
@@ -65,8 +65,11 @@ fn set_kitty_theme(path: &mut PathBuf, is_dark: bool) {
 
     // https://sw.kovidgoyal.net/kitty/conf/
     // send SIGUSR1 to all kitty processes to force config reload
+    // hide output in case kitty isn't running, e.g. nightlife is launched from a different terminal
     Command::new("killall")
         .args(["-s", "SIGUSR1", "kitty"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("reload kitty config");
 }
