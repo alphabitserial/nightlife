@@ -1,75 +1,80 @@
-use std::fs;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use futures_util::stream::StreamExt;
+use zbus::zvariant::OwnedValue;
+use zbus::{proxy, Connection, Result};
 
-const DARK_THEME: &str = "modus_vivendi";
-const LIGHT_THEME: &str = "modus_operandi";
+#[proxy(
+    interface = "org.freedesktop.portal.Settings",
+    default_service = "org.freedesktop.portal.Desktop",
+    default_path = "/org/freedesktop/portal/desktop"
+)]
+trait PortalSettings {
+    /// SettingChanged signal
+    #[zbus(signal)]
+    fn setting_changed(&self, namespace: &str, key: &str, value: OwnedValue) -> Result<()>;
 
-fn main() {
-    // home_dir is deprecated because of possible bad behavior on Windows
-    // we don't care because this tool already assumes a Linux environment
-    #[allow(deprecated)]
-    let home_dir = std::env::home_dir().expect("find home directory");
-    let is_dark = is_dark(&mut home_dir.clone());
-    set_hx_theme(&mut home_dir.clone(), is_dark);
-    set_kitty_theme(&mut home_dir.clone(), is_dark);
+    /// Read a setting value
+    fn read(&self, namespace: &str, key: &str) -> Result<OwnedValue>;
 }
 
-fn is_dark(path: &mut PathBuf) -> bool {
-    path.push(".config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark");
-    let cosmic_dark = fs::read_to_string(path).expect("read cosmic dark mode setting");
-    cosmic_dark
-        .parse()
-        .expect("cosmic setting is_dark is always true or false")
+#[derive(Debug, Clone, Copy)]
+enum ThemePreference {
+    NoPreference,
+    Dark,
+    Light,
+    Unknown,
 }
 
-fn set_hx_theme(path: &mut PathBuf, is_dark: bool) {
-    path.push(".config/helix/config.toml");
-    let conf = fs::read_to_string(&path).expect("read hx config");
+impl From<u32> for ThemePreference {
+    fn from(value: u32) -> Self {
+        match value {
+            0 => Self::NoPreference,
+            1 => Self::Dark,
+            2 => Self::Light,
+            _ => Self::Unknown,
+        }
+    }
+}
 
-    let mut new_conf = String::new();
-    for line in conf.lines() {
-        if line.starts_with("theme = ") {
-            new_conf.push_str("theme = \"");
-            new_conf.push_str({
-                if is_dark {
-                    DARK_THEME
-                } else {
-                    LIGHT_THEME
-                }
-            });
-            new_conf.push_str("\"\n");
-        } else {
-            new_conf.push_str(line);
-            new_conf.push('\n');
+fn parse_theme_preference(value: &OwnedValue) -> ThemePreference {
+    // The value is a variant containing a u32
+    value
+        .downcast_ref::<u32>()
+        .map(|val| ThemePreference::from(val))
+        .map_err(|_| ThemePreference::Unknown)
+        .unwrap()
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let connection = Connection::session().await?;
+
+    let proxy = PortalSettingsProxy::new(&connection).await?;
+
+    // Try to read current theme preference
+    match proxy
+        .read("org.freedesktop.appearance", "color-scheme")
+        .await
+    {
+        Ok(current_value) => {
+            let theme = parse_theme_preference(&current_value);
+            println!("Current theme preference: {:?}", theme);
+        }
+        Err(e) => println!("Could not read current theme preference: {}", e),
+    }
+
+    // Listen for theme changes
+    let mut stream = proxy.receive_setting_changed().await?;
+    println!("Listening for theme changes...");
+
+    while let Some(signal) = stream.next().await {
+        let args = signal.args()?;
+
+        // Check if this is an appearance setting change
+        if args.namespace == "org.freedesktop.appearance" && args.key == "color-scheme" {
+            let theme = parse_theme_preference(&args.value);
+            println!("Theme changed to: {:?}", theme);
         }
     }
 
-    fs::write(&path, new_conf.as_bytes()).expect("write hx config");
-}
-
-fn set_kitty_theme(path: &mut PathBuf, is_dark: bool) {
-    path.push(".config/kitty/");
-    let symlink_name = "current-theme.conf";
-    let theme_file = path.join("themes").join({
-        if is_dark {
-            DARK_THEME
-        } else {
-            LIGHT_THEME
-        }
-    });
-
-    // we must remove the existing symlink first to avoid an fs error
-    fs::remove_file(path.join(symlink_name)).expect("remove symlink");
-    std::os::unix::fs::symlink(theme_file, path.join(symlink_name)).expect("symlink theme");
-
-    // https://sw.kovidgoyal.net/kitty/conf/
-    // send SIGUSR1 to all kitty processes to force config reload
-    // hide output in case kitty isn't running, e.g. nightlife is launched from a different terminal
-    Command::new("killall")
-        .args(["-s", "SIGUSR1", "kitty"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("reload kitty config");
+    Ok(())
 }
